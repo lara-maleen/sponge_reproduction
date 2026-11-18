@@ -1,0 +1,2447 @@
+---
+title: "Sponge_reproduction"
+author: "Lara Beckmann"
+date: "2026-09-17"
+always_allow_html: true
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+  word_document: default
+  html_document: 
+    toc: true
+    number_sections: true
+    toc_float: true
+---
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+
+# PREPARATIONS
+
+## Set working directory 
+> Should include all data files:
+
+* expanded_data_CR.csv
+* wide_data_CR.csv
+* taxa_sheet_all_CR.csv
+* forest_data_CR.csv - also comes with all density files separately
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir ='/Volumes/Work Drive/PhD/Projects/02_Porifera Reproduction/Data & Analysis')
+knitr::opts_chunk$set(echo = TRUE, error = TRUE, message = TRUE, warning = TRUE)
+
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+# Clear the entire environment
+rm(list = ls())
+```
+
+## Load libraries
+
+```{r, echo=TRUE, message=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(ggpubr)
+library(lme4)  # for mixed-effects models
+
+```
+
+## Load data
+
+```{r}
+
+# Load metadata
+meta_sponges <- read_csv("meta_sponges.csv")
+meta_sponges <- meta_sponges %>% 
+  filter(!if_all(everything(), is.na))
+
+# Load oocyte / female gamete data
+oocytes_sponges <- read_csv("oocytes_sponges.csv")
+oocytes_sponges <- oocytes_sponges %>% 
+  filter(!if_all(everything(), is.na))
+
+# Load spermatocysts data
+sperm_sponges <- read_csv("spermatocysts_sponges.csv")
+sperm_sponges <- sperm_sponges %>% 
+  filter(!if_all(everything(), is.na))
+
+```
+
+## Clean up data
+
+```{r}
+# Clean column names (remove spaces/special characters)
+names(meta_sponges) <- gsub(" ", "_", tolower(names(meta_sponges)))
+names(oocytes_sponges) <- gsub(" |#", "", tolower(names(oocytes_sponges)))
+names(sperm_sponges) <- gsub(" |#", "", tolower(names(sperm_sponges)))
+
+
+# Convert dates and handle seasons
+meta_sponges <- meta_sponges %>%
+  mutate(
+    coll_date = mdy(coll_date),
+    coll_month = factor(coll_month, levels = month.name),
+    coll_season = factor(coll_season, levels = c("Winter", "Spring", "Summer", "Fall"))
+  )
+
+# Create reproductive status flags
+meta_sponges <- meta_sponges %>%
+  mutate(
+    reproductive = ifelse(reproductive_status == "reproductive", 1, 0),
+    has_oocytes = ifelse(oocytes_present == "yes", 1, 0)
+  )
+
+# Clean oocyte measurements
+oocytes_sponges <- oocytes_sponges %>%
+  mutate(area = as.numeric(area))
+```
+
+# SUMMARY STATS
+
+```{r}
+
+library(dplyr)
+
+#BY SPECIES BY STAGE
+summary_by_species_stage <- oocytes_sponges %>%
+  # Ensure stage_clean and species are cleaned
+  mutate(
+    species = trimws(as.character(species)),
+    stage_clean = trimws(stage_clean)
+  ) %>%
+  group_by(species, stage_clean) %>%
+  summarise(
+    n_specimens = n_distinct(specimen_id),
+    n_measurements = n(),
+    mean_feret = mean(feret, na.rm = TRUE),
+    sd_feret = sd(feret, na.rm = TRUE),
+    median_feret = median(feret, na.rm = TRUE),
+    min_feret = min(feret, na.rm = TRUE),
+    max_feret = max(feret, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Optional: order stages logically
+  mutate(stage_clean = factor(stage_clean, 
+                              levels = c("previtellogenic", "vitellogenic_I", 
+                                         "vitellogenic_II", "late oocyte or embryo", "embryo", "prelarva", "larva")))
+
+# View the table
+print(summary_by_species_stage)
+
+# BY SPECIES
+summary_by_species <- oocytes_sponges %>%
+  mutate(species = trimws(as.character(species))) %>%
+  group_by(species) %>%
+  summarise(
+    n_specimens = n_distinct(specimen_id),
+    n_measurements = n(),
+    mean_feret = mean(feret, na.rm = TRUE),
+    sd_feret = sd(feret, na.rm = TRUE),
+    median_feret = median(feret, na.rm = TRUE),
+    min_feret = min(feret, na.rm = TRUE),
+    max_feret = max(feret, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(summary_by_species)
+
+```
+## Summary Stats II
+
+> How many specimen are reproductive; do all stages co-occur? 
+
+```{r}
+
+# Is there a sampling bias in date? 
+
+meta_sponges %>%
+  dplyr::count(species, coll_month) %>%
+  ggplot(aes(x = coll_month, y = n, fill = species)) +
+  geom_col(position = "dodge") +
+  labs(title = "Sample Distribution Across Seasons")
+
+
+#Which specimens are reproductive? 
+# Summary table
+meta_sponges %>%
+  group_by(species) %>%
+  dplyr::summarize(
+    n_specimens = n(),
+    n_reproductive = sum(reproductive == 1, na.rm = TRUE),
+    n_non_reproductive = sum(reproductive == 0, na.rm = TRUE),
+    n_unknown = sum(is.na(reproductive)),
+    prop_reproductive = n_reproductive / (n_reproductive + n_non_reproductive)
+  )
+
+
+# Do stages co-occur?
+
+comb_summary <- meta_sponges %>%
+  mutate(across(c(oocytes_present, sperm_present, embryos_present),
+                ~ . == "yes")) %>%
+  rowwise() %>%
+  mutate(stage_combo = paste(
+    c(ifelse(oocytes_present, "oocytes", NA),
+      ifelse(sperm_present, "Sperm", NA),
+      ifelse(embryos_present, "Embryos", NA)),
+    collapse = " + ")) %>%
+  mutate(stage_combo = gsub("NA \\+ ", "", stage_combo),
+         stage_combo = gsub("\\+ NA", "", stage_combo),
+         stage_combo = gsub("NA", "None", stage_combo)) %>%
+  ungroup() %>%
+  group_by(species, stage_combo) %>%
+  summarise(n = n(), .groups = "drop")
+
+library(ggplot2)
+
+ggplot(comb_summary, aes(x = stage_combo, y = species, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Co-occurrence of gamete stages per species",
+       x = "Stage combination",
+       y = "Species",
+       fill = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Ensure stage_clean is a factor with correct levels
+oocytes_sponges$stage_clean <- factor(oocytes_sponges$stage_clean, 
+                                      levels = c("previtellogenic", "vitellogenic_I", "vitellogenic_II",
+                                                 "late oocyte or embryo", "embryo", "prelarva", "larva"),
+                                      ordered = TRUE)
+
+# Per-species histogram
+ggplot(oocytes_sponges, aes(x = feret, fill = stage_clean)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 50, alpha = 0.8,color = "black", linewidth = 0.2) + 
+  facet_wrap(~ species, scales = "free_y") +
+  labs(x = "Feret diameter (µm)", y = "Frequency (number of oocytes)", 
+       fill = "Stage") +
+  theme_minimal(base_size = 12) +
+  scale_fill_viridis_d() +
+  theme(strip.background = element_rect(fill = "grey90", color = NA),
+        strip.text = element_text(face = "italic"))
+
+```
+
+# OOCYTES, EMBRYOS, LARVAE
+
+## Gamete size distribution plot
+
+```{r}
+
+
+library(ggplot2)
+library(dplyr)
+
+# Compute sample sizes per specimen
+specimen_n <- oocytes_sponges %>%
+  group_by(specimen_id) %>%
+  summarise(n_oocytes = n(), .groups = "drop")
+
+# Join back (optional, for labeling)
+plot_data <- oocytes_sponges %>%
+  left_join(specimen_n, by = "specimen_id")
+
+# Per-specimen histogram with n annotation
+ggplot(plot_data, aes(x = feret, fill = stage_clean)) +
+  geom_histogram(aes(y = after_stat(density)), binwidth = 50, alpha = 0.8, color = "black", linewidth = 0.2) +
+  facet_wrap(~ specimen_id, scales = "free_y") +
+  labs(x = "Feret diameter (µm)", y = "Frequency (number of oocytes)", 
+       fill = "Stage") +
+  theme_minimal(base_size = 10) +
+  scale_fill_viridis_d() +
+  # Add n label in each facet
+  geom_text(data = specimen_n, 
+            aes(x = -Inf, y = Inf, label = paste0("n = ", n_oocytes)),
+            inherit.aes = FALSE, hjust = -0.1, vjust = 1.5, size = 3) +
+  theme(strip.text = element_text(face = "bold", size = 8))
+
+
+library(ggplot2)
+library(ggridges)
+library(dplyr)
+
+# Prepare data (ensure species is a factor, e.g., ordered by mean size)
+oocytes_sponges <- oocytes_sponges %>%
+  mutate(species = trimws(species))
+
+# Optional: order species by mean feret (across all stages) for consistent display
+species_order <- oocytes_sponges %>%
+  group_by(species) %>%
+  summarise(mean_size = mean(feret, na.rm = TRUE)) %>%
+  arrange(mean_size) %>%
+  pull(species)
+
+oocytes_sponges$species <- factor(oocytes_sponges$species, levels = species_order)
+
+# Compute label positions
+label_positions <- oocytes_sponges %>%
+  group_by(species) %>%
+  summarise(
+    n_oocytes = n(),
+    x = max(feret, na.rm = TRUE) * 1.1,
+    y = as.numeric(unique(species))  # works if species is factor
+  )
+
+# Plot
+set.seed(123)  # for reproducible jitter
+ggplot(oocytes_sponges, aes(x = feret, y = species, fill = species)) +
+  geom_density_ridges(alpha = 0.5, scale = 0.8, rel_min_height = 0.01) +
+  geom_jitter(aes(color = stage_clean),
+              shape = 16, size = 1.5, alpha = 0.6,
+              height = 0.2, width = 0) +
+  geom_text(data = label_positions,
+            aes(x = x, y = y, label = paste0("n = ", n_oocytes)),
+            hjust = 0, vjust = 1.5, size = 3.5, color = "black") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.2))) +  # room for labels
+  labs(x = "Feret diameter (µm)", y = NULL,
+       fill = "Species", color = "Stage",
+       title = "Gamete size distributions per species") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right",
+        legend.box = "vertical")  # stack legends if needed
+
+
+```
+
+
+## Oocyte comparisons
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(FSA)          # dunnTest
+library(rcompanion)   # cldList
+library(lme4)         # mixed model
+library(emmeans)      # post‑hoc for mixed model
+library(multcomp)     # for cld with emmeans
+library(car)          # Levene's test
+
+# Set seed for reproducible jitter
+set.seed(123)
+
+# Prepare oocyte data
+oocyte_data <- oocytes_sponges %>%
+  filter(stage_clean == "vitellogenic_I") %>%
+  mutate(species = trimws(species))
+
+# Compute specimen means
+oocyte_means <- oocyte_data %>%
+  group_by(species, specimen_id) %>%
+  summarise(mean_feret = mean(feret, na.rm = TRUE), .groups = "drop")
+
+
+oocyte_summary <- oocyte_data %>%
+  group_by(species) %>%
+  summarise(
+    n_specimens = n_distinct(specimen_id),
+    n_oocytes = n(),
+    mean = mean(feret, na.rm = TRUE),
+    sd = sd(feret, na.rm = TRUE),
+    median = median(feret, na.rm = TRUE),
+    min = min(feret, na.rm = TRUE),
+    max = max(feret, na.rm = TRUE)
+  )
+print(oocyte_summary)
+
+# 2. Overall Kruskal‑Wallis test
+kw_oocyte <- kruskal.test(mean_feret ~ species, data = oocyte_means)
+print(kw_oocyte)   # e.g., chi-squared = 10.5, df = 3, p = 0.015
+
+# Dunn test on specimen means
+dunn_test <- dunnTest(mean_feret ~ species, data = oocyte_means, method = "bh")
+print(dunn_test)
+
+# Generate compact letters
+cld_letters <- cldList(P.adj ~ Comparison, data = dunn_test$res, threshold = 0.05)
+print(cld_letters)
+
+# ---- FIX: Map Group names to actual species names ----
+# Create a lookup table: actual species name -> name without spaces
+species_lookup <- data.frame(
+  species = unique(oocyte_means$species),
+  species_no_space = gsub(" ", "", unique(oocyte_means$species))
+)
+
+# Merge with cld_letters
+letters_oocyte <- cld_letters %>%
+  left_join(species_lookup, by = c("Group" = "species_no_space")) %>%
+  # Now we have the correct 'species' column; add max_y for positioning
+  left_join(
+    oocyte_means %>%
+      group_by(species) %>%
+      summarise(max_y = max(mean_feret)),
+    by = "species"
+  ) %>%
+  mutate(y_pos = max_y * 1.1)
+
+# Check that mapping worked
+print(letters_oocyte)
+
+# Order species by mean size (as before)
+species_order <- oocyte_means %>%
+  group_by(species) %>%
+  summarise(mean_size = mean(mean_feret)) %>%
+  arrange(mean_size) %>%
+  pull(species)
+
+oocyte_means$species <- factor(oocyte_means$species, levels = species_order)
+oocyte_data$species <- factor(oocyte_data$species, levels = species_order)
+letters_oocyte$species <- factor(letters_oocyte$species, levels = species_order)
+
+# Plot
+set.seed(123)
+ggplot() +
+  geom_jitter(data = oocyte_data,
+              aes(x = species, y = feret),
+              width = 0.1, size = 1.5, alpha = 0.3, colour = "grey50") +
+  geom_boxplot(data = oocyte_means,
+               aes(x = species, y = mean_feret),
+               width = 0.4, outlier.shape = NA, fill = "skyblue", alpha = 0.5) +
+  geom_point(data = oocyte_means,
+             aes(x = species, y = mean_feret),
+             size = 3, colour = "blue") +
+  geom_text(data = letters_oocyte,
+            aes(x = species, y = y_pos, label = Letter),
+            size = 5) +
+  labs(x = "Species",
+       y = "Vitellogenic oocyte diameter (µm)",
+       title = "Vitellogenic oocyte size per species") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+
+
+```
+
+## Oocyte sensitivity test
+
+```{r}
+
+oocyte_cv <- oocyte_means %>%
+  group_by(species) %>%
+  summarise(CV = sd(mean_feret)/mean(mean_feret) * 100)
+oocyte_cv 
+
+
+library(dplyr)
+library(FSA)
+
+# Assume oocyte_means is already created (species, specimen_id, mean_feret)
+# Ensure species is character (not factor) to avoid factor level issues
+oocyte_means <- oocyte_means %>%
+  mutate(species = as.character(species))
+
+# Get unique specimen IDs
+specimen_ids <- unique(oocyte_means$specimen_id)
+
+# Create an empty list to store results for each iteration
+sensitivity_results <- list()
+
+# Loop over each specimen to leave out
+for (i in seq_along(specimen_ids)) {
+  
+  # Subset data excluding the i-th specimen
+  data_loo <- oocyte_means %>% filter(specimen_id != specimen_ids[i])
+  
+  # Check if at least two species remain (Dunn test requires at least two groups)
+  if (n_distinct(data_loo$species) < 2) {
+    message("Skipping specimen ", specimen_ids[i], ": fewer than 2 species left.")
+    next
+  }
+  
+  # Run Dunn test (Benjamini–Hochberg adjustment)
+  dunn_loo <- tryCatch(
+    dunnTest(mean_feret ~ species, data = data_loo, method = "bh"),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(dunn_loo)) {
+    # Extract the results table and add a column identifying the removed specimen
+    res <- dunn_loo$res %>%
+      mutate(removed_specimen = specimen_ids[i])
+    sensitivity_results[[i]] <- res
+  }
+}
+
+# Combine all results into one data frame
+sensitivity_df <- bind_rows(sensitivity_results)
+
+# View the full sensitivity table
+print(sensitivity_df)
+
+# Optional: count how many times each comparison was significant (P.adj < 0.05)
+sensitivity_summary <- sensitivity_df %>%
+  group_by(Comparison) %>%
+  summarise(
+    n_tests = n(),
+    n_significant = sum(P.adj < 0.05, na.rm = TRUE),
+    proportion_significant = n_significant / n_tests
+  ) %>%
+  arrange(desc(proportion_significant))
+
+print(sensitivity_summary)
+
+# sensitivity analysis shows that the significant difference between Mycale loveni and Tedania kagalaskai is robust: it remained significant in 17 out of 19 iterations (89.5%). The other pairwise comparisons were never significant (or only once, likely due to chance).
+
+
+```
+
+
+## Larvae comparisons
+
+```{r}
+
+
+# Load required libraries (if not already loaded)
+library(dplyr)
+library(ggplot2)
+library(FSA)
+library(rcompanion)
+library(stats)
+
+# Filter larval stage and clean species names
+larvae_data <- oocytes_sponges %>%
+  filter(stage_clean == "larva") %>%
+  mutate(species = trimws(species))
+
+# Compute mean diameter per specimen (to avoid pseudoreplication)
+larvae_means <- larvae_data %>%
+  group_by(species, specimen_id) %>%
+  summarise(mean_feret = mean(feret, na.rm = TRUE), .groups = "drop")
+
+# Summary table: number of specimens, mean, SD, min, max of specimen means
+desc_stats <- larvae_means %>%
+  group_by(species) %>%
+  summarise(
+    n_specimens = n(),
+    mean = mean(mean_feret),
+    sd = sd(mean_feret),
+    min = min(mean_feret),
+    max = max(mean_feret)
+  )
+
+print(desc_stats)
+
+# Create a two‑level factor: "Mycale" vs "Others"
+larvae_means <- larvae_means %>%
+  mutate(group = factor(ifelse(species == "Mycale loveni", "Mycale", "Others")))
+
+# Exact two‑sample permutation test
+set.seed(123)   # for reproducibility
+perm_mycale_vs_others <- oneway_test(mean_feret ~ group, data = larvae_means,
+                                     distribution = "exact")
+perm_mycale_vs_others
+
+
+# Get unique species names
+species_list <- unique(larvae_means$species)
+
+# Matrix to store p‑values (lower triangle)
+pairwise_p <- matrix(NA, nrow = length(species_list), ncol = length(species_list),
+                     dimnames = list(species_list, species_list))
+
+# Loop over all pairs
+for (i in 1:(length(species_list)-1)) {
+  for (j in (i+1):length(species_list)) {
+
+    subdat <- larvae_means %>% 
+      filter(species %in% c(species_list[i], species_list[j])) %>%
+      mutate(species = factor(species))
+
+    test <- coin::oneway_test(mean_feret ~ species,
+                              data = subdat,
+                              distribution = "exact")
+
+    pairwise_p[j, i] <- as.numeric(coin::pvalue(test))
+  }
+}
+# Print the lower triangle (comparisons)
+print(pairwise_p)
+
+## The following tests are not reported, as sample sizes are too small! - but just to explore a little more: 
+
+kruskal.test(mean_feret ~ species, data = larvae_means)
+
+library(FSA)
+dunn_larvae <- dunnTest(mean_feret ~ species, data = larvae_means, method = "bh")
+print(dunn_larvae$res)
+
+# Order species by mean size (for consistent plotting)
+species_order <- larvae_means %>%
+  group_by(species) %>%
+  summarise(mean_size = mean(mean_feret)) %>%
+  arrange(mean_size) %>%
+  pull(species)
+
+larvae_means$species <- factor(larvae_means$species, levels = species_order)
+larvae_data$species <- factor(larvae_data$species, levels = species_order)
+
+# Create the plot
+set.seed(123)   # for reproducible jitter
+ggplot() +
+  # All individual larvae as grey points
+  geom_jitter(data = larvae_data,
+              aes(x = species, y = feret),
+              width = 0.1, size = 1.5, alpha = 0.3, colour = "grey50") +
+  # Boxplot based on specimen means
+  geom_boxplot(data = larvae_means,
+               aes(x = species, y = mean_feret),
+               width = 0.4, outlier.shape = NA, fill = "skyblue", alpha = 0.5) +
+  # Specimen means as blue points
+  geom_point(data = larvae_means,
+             aes(x = species, y = mean_feret),
+             size = 3, colour = "blue") +
+  labs(x = "Species",
+       y = "Larvae diameter (µm)",
+       title = "Larvae size per species (specimen means)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+
+```
+
+## Larvae sensitivity test 
+
+```{r}
+
+library(dplyr)
+library(coin)
+
+# Assume larvae_means is already created (species, specimen_id, mean_feret)
+# Ensure species is character to avoid factor level issues
+larvae_means <- larvae_means %>%
+  mutate(species = as.character(species))
+
+# Get unique specimen IDs
+specimen_ids <- unique(larvae_means$specimen_id)
+
+# Create lists to store results
+results_mycale_vs_others <- list()   # for Mycale vs. Others
+results_pairwise <- list()            # for all pairwise comparisons
+
+## Not included in results - probably not meaningful if Tedania is completely taken out with only one specimen with larvae... 
+# Loop over each specimen to leave out
+for (i in seq_along(specimen_ids)) {
+  
+  # Subset data excluding the i-th specimen
+  data_loo <- larvae_means %>% filter(specimen_id != specimen_ids[i])
+  
+  # Skip if fewer than 2 species remain (Mycale vs. Others needs both groups)
+  if (n_distinct(data_loo$species) < 2) {
+    message("Skipping specimen ", specimen_ids[i], ": fewer than 2 species left.")
+    next
+  }
+  
+  # ---- 1. Mycale vs. Others ----
+  # Create group variable
+  data_loo_group <- data_loo %>%
+    mutate(group = factor(ifelse(species == "Mycale loveni", "Mycale", "Others")))
+  
+  # Only run if both levels present
+  if (nlevels(data_loo_group$group) == 2) {
+    test_mycale <- tryCatch(
+      oneway_test(mean_feret ~ group, data = data_loo_group, distribution = "exact"),
+      error = function(e) NULL
+    )
+    if (!is.null(test_mycale)) {
+      res_mycale <- data.frame(
+        removed_specimen = specimen_ids[i],
+        comparison = "Mycale vs Others",
+        p_value = as.numeric(pvalue(test_mycale)),
+        stringsAsFactors = FALSE
+      )
+      results_mycale_vs_others[[i]] <- res_mycale
+    }
+  }
+  
+  # ---- 2. Pairwise comparisons ----
+  # Get species present in this subset
+  spp_present <- unique(data_loo$species)
+  
+  # Loop over all pairs (only if at least 2 species)
+  if (length(spp_present) >= 2) {
+    for (a in 1:(length(spp_present)-1)) {
+      for (b in (a+1):length(spp_present)) {
+        sp1 <- spp_present[a]
+        sp2 <- spp_present[b]
+        
+        # Subset data for these two species
+        pair_dat <- data_loo %>% filter(species %in% c(sp1, sp2))
+        
+        # Ensure both species have at least one observation
+        if (n_distinct(pair_dat$species) == 2) {
+          pair_dat <- pair_dat %>% mutate(species = factor(species))
+          
+          test_pair <- tryCatch(
+            oneway_test(mean_feret ~ species, data = pair_dat, distribution = "exact"),
+            error = function(e) NULL
+          )
+          if (!is.null(test_pair)) {
+            res_pair <- data.frame(
+              removed_specimen = specimen_ids[i],
+              comparison = paste(sp1, "-", sp2),
+              p_value = as.numeric(pvalue(test_pair)),
+              stringsAsFactors = FALSE
+            )
+            # Store in list
+            idx <- length(results_pairwise) + 1
+            results_pairwise[[idx]] <- res_pair
+          }
+        }
+      }
+    }
+  }
+}
+
+# Combine results into data frames
+sensitivity_mycale <- bind_rows(results_mycale_vs_others)
+sensitivity_pairwise <- bind_rows(results_pairwise)
+
+# View summaries
+print(sensitivity_mycale)
+print(sensitivity_pairwise)
+
+# Optional: summarise how often each comparison was significant (p < 0.05)
+summary_pairwise <- sensitivity_pairwise %>%
+  group_by(comparison) %>%
+  summarise(
+    n_tests = n(),
+    n_significant = sum(p_value < 0.05, na.rm = TRUE),
+    proportion_significant = n_significant / n_tests
+  ) %>%
+  arrange(desc(proportion_significant))
+
+print(summary_pairwise)
+
+# For Mycale vs. Others:
+summary_mycale <- sensitivity_mycale %>%
+  summarise(
+    n_tests = n(),
+    n_significant = sum(p_value < 0.05),
+    proportion_significant = n_significant / n_tests
+  )
+print(summary_mycale)
+
+```
+
+
+## Correlations
+
+```{r}
+
+# =============================================================================
+# ENVIRONMENTAL INFLUENCES ON REPRODUCTIVE STATUS
+# =============================================================================
+#
+# Aim:
+# Test whether reproductive status is associated with:
+#   - species
+#   - depth
+#   - latitude
+#   - longitude
+#   - collection month
+#
+# Final approach:
+# Firth's penalized likelihood logistic regression is used because
+# Tedania kagalaskai is completely separated (all specimens reproductive).
+#
+# The final model contains depth + species.
+# =============================================================================
+
+
+# =============================================================================
+# 1. LOAD PACKAGES
+# =============================================================================
+
+library(tidyverse)
+library(lubridate)
+library(logistf)
+library(car)
+library(ggplot2)
+
+
+# =============================================================================
+# 2. PREPARE DATA
+# =============================================================================
+
+meta_env_all <- meta_sponges %>%
+    dplyr::select(
+        specimen_id,
+        species,
+        reproductive_status,
+        depth,
+        lat,
+        lon,
+        coll_date
+    ) %>%
+    filter(
+        !is.na(reproductive_status),
+        !is.na(species),
+        !is.na(depth),
+        !is.na(lat),
+        !is.na(lon),
+        !is.na(coll_date)
+    ) %>%
+    mutate(
+        # Binary response:
+        # 1 = reproductive
+        # 0 = non-reproductive
+        reproductive_bin = if_else(
+            reproductive_status == "reproductive",
+            1,
+            0
+        ),
+
+        # Species as categorical predictor
+        species = factor(species),
+
+        # Collection month
+        month_num = month(coll_date)
+    )
+
+
+# =============================================================================
+# 3. BASIC DATA CHECKS
+# =============================================================================
+
+str(meta_env_all)
+
+# Number of specimens per species and reproductive status
+
+table(
+    meta_env_all$species,
+    meta_env_all$reproductive_bin
+)
+
+
+# =============================================================================
+# 4. DESCRIPTIVE SUMMARY OF REPRODUCTIVE STATUS
+# =============================================================================
+
+reproductive_summary <- meta_env_all %>%
+    group_by(species, reproductive_bin) %>%
+    summarise(
+        n = n(),
+        .groups = "drop"
+    ) %>%
+    group_by(species) %>%
+    mutate(
+        percentage = 100 * n / sum(n)
+    ) %>%
+    ungroup()
+
+reproductive_summary
+
+
+# =============================================================================
+# 5. CHECK FOR COMPLETE SEPARATION
+# =============================================================================
+
+with(
+    meta_env_all,
+    table(species, reproductive_bin)
+)
+
+# Tedania kagalaskai has 0 non-reproductive and 7 reproductive specimens,
+# resulting in complete separation in ordinary logistic regression.
+#
+# Therefore, Firth's penalized likelihood logistic regression is used
+# for the final analysis.
+
+
+# =============================================================================
+# 6. FIRTH LOGISTIC REGRESSION: CANDIDATE MODELS
+# =============================================================================
+#
+# Firth logistic regression is used throughout because of complete separation.
+#
+# Candidate models:
+#   1. Species
+#   2. Depth + species
+#   3. Depth + latitude + species
+#   4. Depth + longitude + species
+#   5. Depth + species + longitude + month
+#   6. Full model
+#
+# The main question is whether environmental predictors beyond depth
+# improve the model sufficiently to justify their inclusion.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 6a. Species-only model
+# -----------------------------------------------------------------------------
+
+m_species_firth <- logistf(
+    reproductive_bin ~ species,
+    data = meta_env_all
+)
+
+
+# -----------------------------------------------------------------------------
+# 6b. Depth + species
+# -----------------------------------------------------------------------------
+
+m_depth_species_firth <- logistf(
+    reproductive_bin ~ depth + species,
+    data = meta_env_all
+)
+
+
+# -----------------------------------------------------------------------------
+# 6c. Depth + latitude + species
+# -----------------------------------------------------------------------------
+
+m_depth_lat_species_firth <- logistf(
+    reproductive_bin ~ depth + lat + species,
+    data = meta_env_all
+)
+
+
+# -----------------------------------------------------------------------------
+# 6d. Depth + longitude + species
+# -----------------------------------------------------------------------------
+
+m_depth_lon_species_firth <- logistf(
+    reproductive_bin ~ depth + lon + species,
+    data = meta_env_all
+)
+
+
+# -----------------------------------------------------------------------------
+# 6e. Depth + longitude + month + species
+# -----------------------------------------------------------------------------
+
+m_depth_lon_month_species_firth <- logistf(
+    reproductive_bin ~ depth + lon + month_num + species,
+    data = meta_env_all
+)
+
+
+# -----------------------------------------------------------------------------
+# 6f. Full model
+# -----------------------------------------------------------------------------
+
+m_full_firth <- logistf(
+    reproductive_bin ~ depth + lat + lon + month_num + species,
+    data = meta_env_all
+)
+
+
+# =============================================================================
+# 7. MODEL COMPARISON
+# =============================================================================
+#
+# logistf does not provide the standard AIC.
+#
+# We therefore calculate an AIC-like criterion based on the penalized
+# log-likelihood:
+#
+#   AIC-like = -2 × penalized log-likelihood + 2 × number of parameters
+#
+# Lower values indicate better relative model fit.
+#
+# This criterion is used only as a comparative measure among the
+# Firth models.
+# =============================================================================
+
+
+firth_AIC_like <- function(model) {
+    loglik_full <- as.numeric(model$loglik["full"])
+    k <- length(model$coefficients)
+    aic_like <- -2 * loglik_full + 2 * k
+    return(aic_like)
+}
+
+firth_aic_table <- tibble(
+
+    model = c(
+        "Species",
+        "Depth + species",
+        "Depth + latitude + species",
+        "Depth + longitude + species",
+        "Depth + longitude + month + species",
+        "Full model"
+    ),
+
+    AIC_like = c(
+        firth_AIC_like(m_species_firth),
+        firth_AIC_like(m_depth_species_firth),
+        firth_AIC_like(m_depth_lat_species_firth),
+        firth_AIC_like(m_depth_lon_species_firth),
+        firth_AIC_like(m_depth_lon_month_species_firth),
+        firth_AIC_like(m_full_firth)
+    )
+)
+
+firth_aic_table %>%
+    arrange(AIC_like)
+
+
+# =============================================================================
+# 8. LIKELIHOOD-RATIO TESTS
+# =============================================================================
+#
+# Compare the simpler and more complex Firth models.
+#
+# NOTE:
+# These comparisons should be interpreted cautiously because the sample
+# size is small and Firth models use penalized likelihood.
+#
+# The primary criterion for the final model is parsimony together with
+# consistency of the predictor effects.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 8a. Does depth improve the species-only model?
+# -----------------------------------------------------------------------------
+
+anova(
+    m_species_firth,
+    m_depth_species_firth
+)
+
+
+# -----------------------------------------------------------------------------
+# 8b. Does latitude improve the depth + species model?
+# -----------------------------------------------------------------------------
+
+anova(
+    m_depth_species_firth,
+    m_depth_lat_species_firth
+)
+
+
+# -----------------------------------------------------------------------------
+# 8c. Does longitude improve the depth + species model?
+# -----------------------------------------------------------------------------
+
+anova(
+    m_depth_species_firth,
+    m_depth_lon_species_firth
+)
+
+
+# -----------------------------------------------------------------------------
+# 8d. Does month improve the depth + species model?
+# -----------------------------------------------------------------------------
+
+m_depth_month_species_firth <- logistf(
+    reproductive_bin ~ depth + month_num + species,
+    data = meta_env_all
+)
+
+anova(
+    m_depth_species_firth,
+    m_depth_month_species_firth
+)
+
+
+# =============================================================================
+# 9. FINAL MODEL
+# =============================================================================
+#
+# The final model contains depth + species.
+#
+# This model is preferred because:
+#
+#   - depth provides a clear improvement over the species-only model;
+#   - species remains an important predictor;
+#   - latitude, longitude and month do not provide sufficient evidence
+#     to justify their inclusion;
+#   - the model is more parsimonious and appropriate for the small sample.
+# =============================================================================
+
+
+final_model_firth <- logistf(
+    reproductive_bin ~ depth + species,
+    data = meta_env_all
+)
+
+summary(final_model_firth)
+
+
+# =============================================================================
+# 10. FINAL MODEL COEFFICIENTS
+# =============================================================================
+
+final_results <- tibble(
+    term = names(final_model_firth$coefficients),
+    beta = final_model_firth$coefficients,
+    OR = exp(final_model_firth$coefficients),
+    CI_lower = exp(final_model_firth$ci.lower),
+    CI_upper = exp(final_model_firth$ci.upper),
+    p_value = final_model_firth$prob
+)
+
+final_results
+
+
+# =============================================================================
+# 11. MULTICOLLINEARITY
+# =============================================================================
+#
+# Assess multicollinearity among environmental predictors using the full
+# model. This is retained as a diagnostic because latitude, longitude,
+# depth and month were considered as candidate predictors.
+# =============================================================================
+
+vif_full <- vif(
+    glm(
+        reproductive_bin ~ depth + lat + lon + month_num + species,
+        data = meta_env_all,
+        family = binomial
+    )
+)
+
+vif_full
+
+
+# =============================================================================
+# 12. PREDICTED PROBABILITIES ACROSS DEPTH
+# =============================================================================
+#
+# Predictions are generated for each species across the observed depth range.
+#
+# Because the final model contains only depth and species, no other
+# environmental variable needs to be held constant.
+# =============================================================================
+
+newdata_depth <- expand.grid(
+
+    depth = seq(
+        min(meta_env_all$depth),
+        max(meta_env_all$depth),
+        length.out = 100
+    ),
+
+    species = levels(meta_env_all$species)
+)
+
+
+newdata_depth$predicted_probability <- predict(
+    final_model_firth,
+    newdata = newdata_depth,
+    type = "response"
+)
+
+
+# =============================================================================
+# 13. PLOT PREDICTED PROBABILITIES
+# =============================================================================
+
+ggplot(
+    meta_env_all,
+    aes(
+        x = depth,
+        y = reproductive_bin,
+        color = species
+    )
+) +
+
+    geom_jitter(
+        height = 0.05,
+        width = 0,
+        alpha = 0.6
+    ) +
+
+    geom_line(
+        data = newdata_depth,
+        aes(
+            x = depth,
+            y = predicted_probability,
+            color = species
+        ),
+        linewidth = 1
+    ) +
+
+    labs(
+        x = "Depth (m)",
+        y = "Probability of reproductive status",
+        color = "Species"
+    ) +
+
+    theme_minimal()
+
+
+# =============================================================================
+# 14. SPECIES-SPECIFIC ANALYSES
+# =============================================================================
+#
+# These are exploratory/descriptive because sample sizes are small.
+#
+# Tedania kagalaskai is not analysed separately because all seven specimens
+# are reproductive and therefore there is no variation in the response.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Monanchora pulchra
+# -----------------------------------------------------------------------------
+
+mona_data <- meta_env_all %>%
+    filter(species == "Monanchora pulchra")
+
+m_mona_depth <- logistf(
+    reproductive_bin ~ depth,
+    data = mona_data
+)
+
+
+# -----------------------------------------------------------------------------
+# Mycale (Mycale) loveni
+# -----------------------------------------------------------------------------
+
+myca_data <- meta_env_all %>%
+    filter(species == "Mycale (Mycale) loveni")
+
+m_myca_depth <- logistf(
+    reproductive_bin ~ depth,
+    data = myca_data
+)
+
+
+# -----------------------------------------------------------------------------
+# Stelodoryx oxeata
+# -----------------------------------------------------------------------------
+
+stel_data <- meta_env_all %>%
+    filter(species == "Stelodoryx oxeata")
+
+m_stel_depth <- logistf(
+    reproductive_bin ~ depth,
+    data = stel_data
+)
+
+
+# =============================================================================
+# 15. REPRODUCTIVE STAGES AND COLLECTION MONTH
+# =============================================================================
+#
+# Separate descriptive analysis of reproductive stages.
+#
+# This is not used as a formal test of environmental effects because
+# sampling across months is strongly unbalanced.
+# =============================================================================
+
+oocytes_df <- oocytes_sponges %>%
+
+    left_join(
+        meta_sponges %>%
+            dplyr::select(
+                specimen_id,
+                coll_month
+            ),
+        by = "specimen_id"
+    )
+
+
+# Number of observations per collection month
+
+table(oocytes_df$coll_month)
+
+
+# Number of specimens per species and month
+
+table(
+    meta_sponges$species,
+    meta_sponges$coll_month
+)
+
+
+# =============================================================================
+# END OF ANALYSIS
+# =============================================================================
+
+```
+
+
+```{r}
+
+# Are oocyte size and larvae size correlated? 
+# Create a species-level dataset
+species_means <- bind_rows(
+  oocyte_means %>% group_by(species) %>% summarise(oocyte_mean = mean(mean_feret)),
+  larvae_means %>% group_by(species) %>% summarise(larvae_mean = mean(mean_feret))
+) %>% group_by(species) %>% summarise_all(mean, na.rm = TRUE)
+
+# Correlation test
+cor.test(species_means$oocyte_mean, species_means$larvae_mean, method = "spearman")
+
+
+# =============================================================================
+# Logistic regression analysis: environmental correlates of reproduction
+# Data: meta_sponges with columns:
+#   - reproductive_status : factor/character ("reproductive"/"non-reproductive")
+#   - species             : factor
+#   - depth               : numeric (m)
+#   - lat                 : numeric (decimal degrees)
+#   - lon                 : numeric (decimal degrees)
+#   - coll_date           : Date (collection date)
+#   - fixative            : factor (e.g., "EMA", "ethanol", "unknown")
+#
+# Species identity is included as a fixed effect in all comparative models.
+# Collection month is evaluated as a continuous temporal predictor.
+# Tedania kagalaskai is excluded from comparative modelling because all
+# examined individuals were reproductive.
+# =============================================================================
+
+library(tidyverse)
+library(lubridate)
+library(car)          # for vif()
+library(broom)        # for tidy model output
+library(ggplot2)
+library(brglm2)       # for Firth's penalized likelihood (if needed)
+
+# -----------------------------------------------------------------------------
+# 1. Prepare data
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 1. Prepare data
+# -----------------------------------------------------------------------------
+
+meta_env <- meta_sponges %>%
+  filter(
+    !is.na(reproductive_status),
+    !is.na(depth),
+    !is.na(lat),
+    !is.na(lon),
+    !is.na(coll_date)
+  ) %>%
+  mutate(
+    reproductive_bin = ifelse(
+      reproductive_status == "reproductive", 1, 0
+    ),
+    species = factor(species),
+
+    # Collection month as a continuous variable (1–12). This is ok bc we don't have December or January e.g. 
+    month_num = lubridate::month(coll_date)
+  ) %>%
+  drop_na(depth, lat, lon, month_num, species)
+
+# Quick check of sample sizes
+table(meta_env$species, meta_env$reproductive_bin)
+
+## Here, we exclude Tedania now, because ALL individuals are reproductive, so the model doesnt work well. So we remove it
+meta_env <- meta_clean %>%
+  dplyr::filter(species != "Tedania kagalaskai") %>%
+  droplevels()
+
+table(meta_env$species, meta_env$reproductive_bin)
+
+# -----------------------------------------------------------------------------
+# 2. Univariate models (each predictor + species)
+# -----------------------------------------------------------------------------
+# Because species can explain a lot of variation, we include it in every model
+# to test the additional effect of each environmental variable. Species is included in every model to test whether each environmental
+# variable explains additional variation in reproductive status.
+
+# Species-only model
+m_species <- glm(
+  reproductive_bin ~ species,
+  data = meta_env,
+  family = binomial
+)
+summary(m_species)
+
+# Depth
+m_depth <- glm(reproductive_bin ~ depth + species, 
+               data = meta_env, family = binomial)
+summary(m_depth)
+# LRT: does depth improve the species-only model?
+anova(m_species, m_depth, test = "Chisq")
+
+# Latitude
+m_lat <- glm(reproductive_bin ~ lat + species, 
+             data = meta_env, family = binomial)
+summary(m_lat)
+anova(m_species, m_lat, test = "Chisq")
+
+# Longitude
+m_lon <- glm(reproductive_bin ~ lon + species, 
+             data = meta_env, family = binomial)
+summary(m_lon)
+anova(m_species, m_lon, test = "Chisq")
+
+# Collection month as a continuous predictor
+m_month <- glm(
+  reproductive_bin ~ month_num + species,
+  data = meta_env,
+  family = binomial
+)
+summary(m_month)
+# LRT
+anova(m_species, m_month, test = "Chisq")
+
+
+# Fixative (but doesnt really makes sense for reproductive status - that should be for the sizes...) 
+if("fixative" %in% names(meta_env)) {
+  m_fix <- glm(reproductive_bin ~ fixative + species, 
+               data = meta_env, family = binomial)
+  summary(m_fix)
+  anova(m_species, m_fix, test = "Chisq")
+}
+
+# -----------------------------------------------------------------------------
+# 3. Multivariable model building
+# -----------------------------------------------------------------------------
+# Start with a model containing all potentially relevant predictors.
+# Choose the best representation of time: month_fct, month_num, or season.
+# Based on univariate results and sample size, decide.
+# Here we illustrate using depth, lat, season, and species.
+
+full_model <- glm(reproductive_bin ~ depth + lat + lon + month_num + species, 
+                  data = meta_env, family = binomial)
+summary(full_model)
+
+# Check for multicollinearity (VIF)
+vif(full_model)  # VIF > 5–10 indicates problematic collinearity
+
+# Check for separation (perfect prediction) – if coefficients are huge with huge SEs,
+# or if warnings about fitted probabilities 0 or 1 appear.
+# If separation is present, consider Firth's correction:
+if(any(grepl("separation", warnings()))) {
+  full_model_firth <- glm(reproductive_bin ~ depth + lat + lon + month_num + species, 
+                          data = meta_env, family = binomial, 
+                          method = "brglmFit")  # from brglm2
+  summary(full_model_firth)
+}
+
+# Model selection/simplification using likelihood ratio tests (manual backward elimination)
+# Compare full model to model without depth
+m_no_depth <- update(full_model, . ~ . - depth)
+anova(m_no_depth, full_model, test = "Chisq")
+
+# Without lat
+m_no_lat <- update(full_model, . ~ . - lat)
+anova(m_no_lat, full_model, test = "Chisq")
+
+# Without longitude
+m_no_lon <- update(full_model, . ~ . - lon)
+
+anova(m_no_lon, full_model, test = "Chisq")
+
+# Without collection month
+m_no_month <- update(full_model, . ~ . - month_num)
+
+anova(m_no_month,full_model,test = "Chisq")
+
+# AIC-based selection (alternative) - not included in my results as not needed... 
+step_model <- step(full_model, direction = "backward", trace = 0)
+summary(step_model)
+
+
+# -----------------------------------------------------------------------------
+# 4. Final model interpretation
+
+# Based on the current results, the final parsimonious model is:
+# reproductive status ~ depth + lon + species
+# BUT I also test a primary model, without longitude
+
+# -----------------------------------------------------------------------------
+
+final_model <- glm(
+  reproductive_bin ~ depth + lon + species,
+  data = meta_env,
+  family = binomial
+)
+
+summary(final_model)
+
+# Odds ratios
+exp(coef(final_model))
+# 95% confidence intervals for odds ratios
+exp(confint(final_model))
+
+final_model_br <- glm(
+     reproductive_bin ~ depth + lon + species,
+     data = meta_env,
+     family = binomial,
+     method = "brglmFit"
+)
+ 
+summary(final_model_br)
+exp(coef(final_model_br))
+confint(final_model_br)
+exp(confint(final_model_br))
+
+#Model without lon 
+final_model_2 <- glm(
+  reproductive_bin ~ depth + species,
+  data = meta_env,
+  family = binomial
+)
+
+summary(final_model_2)
+
+# Odds ratios
+exp(coef(final_model_2))
+# 95% confidence intervals for odds ratios
+exp(confint(final_model_2))
+
+
+# -----------------------------------------------------------------------------
+# 5. Visualisation of predicted probabilities
+# -----------------------------------------------------------------------------
+# Create prediction data for each species over the range of a continuous variable
+# while holding other variables constant (e.g., at median or reference level).
+
+newdata_depth <- expand.grid(
+  depth = seq(
+    min(meta_env$depth),
+    max(meta_env$depth),
+    length.out = 100
+  ),
+  lon = median(meta_env$lon),
+  species = levels(meta_env$species)
+)
+
+newdata_depth$pred <- predict(
+  final_model_br,
+  newdata = newdata_depth,
+  type = "response"
+)
+
+# Plot
+ggplot(
+  meta_env,
+  aes(x = depth, y = reproductive_bin, color = species)
+) +
+  geom_jitter(
+    height = 0.05,
+    width = 0,
+    alpha = 0.6
+  ) +
+  geom_line(
+    data = newdata_depth,
+    aes(y = pred, color = species),
+    linewidth = 1
+  ) +
+  labs(
+    x = "Depth (m)",
+    y = "Probability of reproduction"
+  ) +
+  theme_minimal()
+
+
+# Separate panels by species
+ggplot(
+  meta_env,
+  aes(x = depth, y = reproductive_bin)
+) +
+  geom_jitter(
+    height = 0.05,
+    width = 0,
+    alpha = 0.6
+  ) +
+  geom_line(
+    data = newdata_depth,
+    aes(y = pred),
+    linewidth = 1
+  ) +
+  facet_wrap(~ species) +
+  labs(
+    x = "Depth (m)",
+    y = "Probability of reproduction"
+  ) +
+  theme_minimal()
+
+
+# -----------------------------------------------------------------------------
+# 7. Species-specific descriptive models
+# -----------------------------------------------------------------------------
+
+mona_data <- filter(
+  meta_env,
+  species == "Monanchora pulchra"
+)
+
+stel_data <- filter(
+  meta_env,
+  species == "Stelodoryx oxeata"
+)
+
+myca_data <- filter(
+  meta_env,
+  species == "Mycale (Mycale) loveni"
+)
+
+# Tedania retained for descriptive summaries only
+teda_data <- filter(
+  meta_sponges,
+  species == "Tedania kagalaskai"
+)
+
+
+# Monanchora
+m_mona_depth <- glm(
+  reproductive_bin ~ depth,
+  data = mona_data,
+  family = binomial
+)
+
+m_mona_lat <- glm(
+  reproductive_bin ~ lat,
+  data = mona_data,
+  family = binomial
+)
+
+m_mona_month <- glm(
+  reproductive_bin ~ month_num,
+  data = mona_data,
+  family = binomial
+)
+
+
+# Stelodoryx – bias-reduced logistic regression because of imbalance
+m_stel_depth <- glm(
+  reproductive_bin ~ depth,
+  data = stel_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+m_stel_lat <- glm(
+  reproductive_bin ~ lat,
+  data = stel_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+m_stel_month <- glm(
+  reproductive_bin ~ month_num,
+  data = stel_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+
+# Mycale – bias-reduced logistic regression
+m_myca_depth <- glm(
+  reproductive_bin ~ depth,
+  data = myca_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+m_myca_lat <- glm(
+  reproductive_bin ~ lat,
+  data = myca_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+m_myca_month <- glm(
+  reproductive_bin ~ month_num,
+  data = myca_data,
+  family = binomial,
+  method = "brglmFit"
+)
+
+
+# Inspect species-specific models if needed
+m_myca_lat
+m_myca_depth
+m_myca_month
+
+m_stel_lat
+m_stel_depth
+m_stel_month
+
+m_mona_lat
+m_mona_depth
+m_mona_month
+
+
+# =============================================================================
+# REPRODUCTIVE STAGES AND COLLECTION MONTH
+# =============================================================================
+#
+# This is a descriptive analysis of reproductive-stage composition across
+# collection months. It is kept separate from the logistic regression of
+# reproductive status.
+# =============================================================================
+
+oocytes_df <- oocytes_sponges %>%
+  left_join(
+    meta_sponges %>%
+      dplyr::select(
+        specimen_id,
+        coll_month
+      ),
+    by = "specimen_id"
+  )
+
+
+# Check structure
+glimpse(oocytes_df)
+
+
+stage_order <- c(
+  "previtellogenic",
+  "vitellogenic_I",
+  "vitellogenic_II",
+  "late oocyte or embryo",
+  "embryo",
+  "prelarva",
+  "larva"
+)
+
+# Convert to ordered factor
+oocytes_df$stage_clean <- factor(
+  oocytes_df$stage_clean,
+  levels = stage_order,
+  ordered = TRUE
+)
+
+
+# Determine the most advanced reproductive stage per specimen
+specimen_stage <- oocytes_df %>%
+  group_by(
+    species,
+    specimen_id,
+    coll_month
+  ) %>%
+  summarise(
+    max_stage = stage_clean[which.max(as.numeric(stage_clean))],
+    has_embryo = any(
+      stage_clean %in% c("embryo", "prelarva", "larva")
+    ),
+    has_larvae = any(
+      stage_clean %in% c("prelarva", "larva")
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    max_stage = factor(
+      max_stage,
+      levels = stage_order,
+      ordered = TRUE
+    )
+  )
+
+
+# Count specimens per species and month
+counts <- specimen_stage %>%
+  group_by(species, coll_month) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )
+
+
+# Plot reproductive-stage composition by collection month
+ggplot(
+  specimen_stage,
+  aes(x = coll_month, fill = max_stage)
+) +
+  geom_bar(position = "fill") +
+  geom_text(
+    data = counts,
+    aes(
+      x = coll_month,
+      y = 1.05,
+      label = n
+    ),
+    inherit.aes = FALSE,
+    size = 3,
+    vjust = 0
+  ) +
+  facet_wrap(~ species) +
+  labs(
+    x = "Collection month",
+    y = "Proportion of specimens",
+    fill = "Maximum stage"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  )
+
+
+# =============================================================================
+# OOCYTE SIZES
+# =============================================================================
+
+# Calculate mean oocyte size per specimen for vitellogenic stages
+vit_sizes <- oocytes_df %>%
+  filter(
+    stage_clean %in% c(
+      "vitellogenic_I",
+      "vitellogenic_II"
+    )
+  ) %>%
+  group_by(
+    species,
+    specimen_id,
+    coll_month
+  ) %>%
+  summarise(
+    mean_feret = mean(feret, na.rm = TRUE),
+    n_oocytes = n(),
+    .groups = "drop"
+  )
+
+
+# Check sample sizes
+vit_sizes %>%
+  count(species, coll_month)
+
+
+# Plot oocyte size by collection month
+ggplot(
+  vit_sizes,
+  aes(x = coll_month, y = mean_feret)
+) +
+  geom_boxplot(
+    aes(fill = species),
+    alpha = 0.6
+  ) +
+  geom_jitter(
+    width = 0.2,
+    size = 2,
+    alpha = 0.8
+  ) +
+  facet_wrap(
+    ~ species,
+    scales = "free_y"
+  ) +
+  labs(
+    x = "Collection month",
+    y = "Mean vitellogenic oocyte diameter (µm)"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+
+```
+
+# SPERMATOCYSTS
+
+> Measurements of sperm heads 
+
+```{r}
+
+# Sperm head diameters of individual spermatocysts in four sponge species. Each point represents a single sperm cell, colored by specimen of origin.
+# Spermatocysts are globally ordered from left to right by decreasing mean sperm head diameter across all species. Black diamonds indicate the mean head diameter for each spermatocyst. 
+# Facets separate species, allowing comparison of cyst-level and specimen-level variation within and among species.
+
+
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)      # for p‑values in summary
+library(emmeans)       # for pairwise comparisons
+library(performance)   # for ICC and diagnostics
+library(car)           # for ANOVA (if needed)
+library(patchwork)     # for combining plots (optional)
+library(RColorBrewer)
+
+sperm <- sperm_sponges %>%
+  # Clean species names (if needed)
+  mutate(species = trimws(species)) %>%
+  # Create a unique cyst ID: species + specimen + spermatocyst number
+  mutate(cyst_id = paste(species, specimen_id, spermatocyst_, sep = "_")) %>%
+  # Ensure specimen_id and cyst_id are factors (for random effects)
+  mutate(
+    specimen_id = factor(specimen_id),
+    cyst_id = factor(cyst_id)
+  )
+
+# Check sample sizes per level
+sperm %>%
+  group_by(species) %>%
+  summarise(
+    n_specimens = n_distinct(specimen_id),
+    n_cysts = n_distinct(cyst_id),
+    n_sperm = n()
+  )
+
+desc_species <- sperm %>%
+  group_by(species) %>%
+  summarise(
+    n_specimens = n_distinct(specimen_id),
+    n_cysts = n_distinct(cyst_id),
+    n_sperm = n(),
+    mean_head = mean(head_diameter, na.rm = TRUE),
+    sd_head = sd(head_diameter, na.rm = TRUE),
+    median_head = median(head_diameter, na.rm = TRUE),
+    min_head = min(head_diameter, na.rm = TRUE),
+    max_head = max(head_diameter, na.rm = TRUE)
+  )
+print(desc_species)
+
+desc_specimen <- sperm %>%
+  group_by(species, specimen_id) %>%
+  summarise(
+    n_cysts = n_distinct(cyst_id),
+    n_sperm = n(),
+    mean_head = mean(head_diameter, na.rm = TRUE),
+    sd_head = sd(head_diameter, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(desc_specimen)
+
+
+
+if (!"cyst_id" %in% colnames(sperm)) {
+  sperm <- sperm %>%
+    mutate(cyst_id = paste(species, specimen_id, spermatocyst_, sep = "_"))
+}
+
+# --- 2. Compute cyst means (one row per cyst) ---
+cyst_means <- sperm %>%
+  group_by(species, specimen_id, cyst_id) %>%
+  summarise(mean_head = mean(head_diameter, na.rm = TRUE), .groups = "drop")
+
+# --- 3. Order cysts within each species by mean_head (increasing) ---
+cyst_order <- cyst_means %>%
+  group_by(species) %>%
+  arrange(desc(mean_head), .by_group = TRUE) %>%
+  mutate(cyst_ord = row_number()) %>%   # 1 = smallest mean head diameter
+  ungroup()
+
+# --- 4. Attach cyst order and cyst mean to the raw data ---
+sperm_cyst <- sperm %>%
+  left_join(cyst_order %>% dplyr::select(cyst_id, cyst_ord, mean_head), by = "cyst_id")
+
+# --- 6. Set species order (by overall mean, optional) ---
+species_order <- sperm %>%
+  group_by(species) %>%
+  summarise(mean_head = mean(head_diameter)) %>%
+  arrange(mean_head) %>%
+  pull(species)
+sperm_cyst$species <- factor(sperm_cyst$species, levels = species_order)
+
+# --- 7. Create colour palette for specimens ---
+specimen_ids <- unique(sperm_cyst$specimen_id)
+n_specimens <- length(specimen_ids)
+if (n_specimens <= 9) {
+  specimen_palette <- brewer.pal(n_specimens, "Set1")
+} else {
+  specimen_palette <- colorRampPalette(brewer.pal(8, "Set2"))(n_specimens)
+}
+names(specimen_palette) <- specimen_ids
+
+# --- 8. Build the publication figure ---
+p2_publication <- ggplot(sperm_cyst, aes(x = cyst_ord, y = head_diameter)) +
+  # Raw data points
+  geom_point(aes(colour = specimen_id), 
+             position = position_jitter(width = 0.1), 
+             alpha = 0.5, size = 1.2) +
+  # Cyst means (black diamonds)
+  geom_point(aes(y = mean_head), colour = "black", shape = 18, size = 3) +
+  # Facet by species, free x-scale
+  facet_wrap(~ species, scales = "free_x", nrow = 1) +
+  # Colour scale
+  scale_colour_manual(values = specimen_palette, name = "Specimen") +
+  # Labels
+  labs(x = "Spermatocysts (ordered by increasing mean head diameter)",
+       y = "Sperm head diameter (µm)") +
+  # Theme
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(size = 14, face = "italic"),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(1, "lines")
+  ) +
+  # Sample size annotations
+  geom_text(data = sperm_cyst %>% 
+              group_by(species) %>% 
+              summarise(
+                n_spec = n_distinct(specimen_id),
+                n_cyst = n_distinct(cyst_id),
+                x = Inf, y = Inf,
+                .groups = "drop"
+              ),
+            aes(x = x, y = y, 
+                label = paste0("n_spec = ", n_spec, "\nn_cyst = ", n_cyst)),
+            inherit.aes = FALSE, hjust = 1.1, vjust = 1.5, size = 3.5, colour = "black")
+
+# --- 9. Display the plot ---
+print(p2_publication)
+
+
+
+p1_publication <- ggplot(sperm, aes(x = species, y = head_diameter)) +
+  geom_violin(fill = "grey90", alpha = 0.7, trim = FALSE) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1, colour = "grey30") +
+  labs(x = "Species", y = "Sperm head diameter (µm)") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"),
+    panel.grid.minor = element_blank()
+  ) +
+  # Optional: add sample sizes below x‑axis
+  geom_text(data = sperm %>% group_by(species) %>% summarise(n = n()),
+            aes(x = species, y = -Inf, label = paste0("n = ", n)),
+            vjust = -0.5, size = 3.5, inherit.aes = FALSE)
+
+print(p1_publication)
+
+## STATS
+
+m_base <- lmer(head_diameter ~ species + (1 | specimen_id) + (1 | cyst_id),
+               data = sperm)
+
+# Residual plot
+plot(m_base)
+
+# QQ plot of residuals
+qqnorm(resid(m_base))
+qqline(resid(m_base))
+
+# Shapiro–Wilk test (large sample – may be significant even if close)
+shapiro.test(resid(m_base))
+
+# Homogeneity of variance (plot residuals vs fitted)
+
+m_log <- lmer(log(head_diameter) ~ species + (1 | specimen_id) + (1 | cyst_id),
+              data = sperm)
+
+# Check residuals again
+plot(m_log)
+qqnorm(resid(m_log))
+qqline(resid(m_log))
+
+# Assuming meta_sponges has columns: specimen_id, coll_month, depth
+sperm2 <- sperm %>%
+  left_join(meta_sponges %>% dplyr::select(specimen_id, coll_month, depth), by = "specimen_id") %>%
+  # Convert month to numeric (1–12) and create sine/cosine for cyclic pattern
+  mutate(
+    month_num = as.numeric(as.character(coll_month)),  # adjust if coll_month is factor
+    sin_month = sin(2 * pi * month_num / 12),
+    cos_month = cos(2 * pi * month_num / 12),
+    depth_sc = scale(depth)  # standardise depth
+  )
+
+m_month_factor <- lmer(log(head_diameter) ~ species + coll_month +
+                         (1 | specimen_id) + (1 | cyst_id),
+                       data = sperm2)
+
+m_depth_lin <- lmer(log(head_diameter) ~ species + depth_sc +
+                      (1 | specimen_id) + (1 | cyst_id),
+                    data = sperm2)
+m_depth_quad <- lmer(log(head_diameter) ~ species + depth_sc + I(depth_sc^2) +
+                       (1 | specimen_id) + (1 | cyst_id),
+                     data = sperm2)
+
+anova(m_depth_lin, m_depth_quad)  # test quadratic term
+
+
+# Use the best‑fitting model (e.g., m_species or m_month)
+emm_species <- emmeans(m_species, ~ species)
+pairs(emm_species, adjust = "tukey")
+
+# Compact letter display
+library(multcomp)
+cld(emm_species, adjust = "tukey", Letters = letters)
+
+
+# From the log-transformed model (m_log or m_depth_quad)
+icc(m_depth_quad)
+VarCorr(m_depth_quad)
+
+# Boxplot of cyst means per species
+cyst_means %>%
+  ggplot(aes(x = species, y = mean_head)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  labs(y = "Mean sperm head diameter per cyst (µm)") +
+  theme_bw()
+
+
+```
+
+# MAP
+
+```{r} 
+
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
+
+# Map for our collections
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot(data = world) +
+  geom_sf(fill = "gray95", color = "gray80") +
+  geom_point(data = meta_sponges, aes(x = lon, y = lat, color = depth, shape = species), #can also do species as color if needed 
+             size = 2, alpha = 0.7) +
+  coord_sf(xlim = c(-181, -132), ylim = c(50, 61), expand = FALSE) +
+  labs(title = "Sampling locations in Alaska by species",
+       x = "Longitude", y = "Latitude", color = "Depth [m]") +
+  theme_bw()
+
+
+ggplot(data = world) +
+  geom_sf(fill = "gray95", color = "gray80") +
+  geom_point(data = meta_sponges, 
+             aes(x = lon, y = lat, color = species),  # color by species
+             size = 2, alpha = 0.7) +
+  coord_sf(xlim = c(-181, -132), ylim = c(50, 61), expand = FALSE) +
+  labs(title = "Sampling locations in Alaska by species",
+       x = "Longitude", y = "Latitude", 
+       color = "Species") +  # updated legend title
+  theme_bw()
+
+
+# Prepare specimen data
+meta_sponges <- meta_sponges %>%
+  filter(!is.na(lon), !is.na(lat)) %>%           # remove any missing coordinates
+  mutate(lon_360 = ifelse(lon < 0, lon + 360, lon))  # convert to 0–360 for mapping
+
+# (Optional) set species order for legend
+meta_sponges <- meta_sponges %>%
+  mutate(species = factor(species, levels = c("Monanchora pulchra", 
+                                              "Mycale (Mycale) loveni", 
+                                              "Stelodoryx oxeata", 
+                                              "Tedania kagalaskai")))
+
+# Base map (already shifted)
+world_shifted <- st_shift_longitude(ne_countries(scale = "medium", returnclass = "sf"))
+
+# Choose map limits – either use the same as before or adjust to points
+xlim_final <- c(160, 260)   # covers Aleutians to Gulf of Alaska
+ylim_final <- c(50, 62)      # adjust if points extend further south/north
+
+# Create the map
+map_specimens <- ggplot() +
+  geom_sf(data = world_shifted, fill = "gray95", color = "gray70", size = 0.2) +
+  geom_point(data = meta_sponges,
+             aes(x = lon_360, y = lat, color = species),
+             size = 2, alpha = 0.8) +
+  scale_color_manual(values = c("Monanchora pulchra" = "blue",
+                                 "Mycale (Mycale) loveni" = "red",
+                                 "Stelodoryx oxeata" = "yellow",
+                                 "Tedania kagalaskai" = "green")) +  # match the earlier colors
+  coord_sf(xlim = xlim_final, ylim = ylim_final, expand = FALSE) +
+  labs(title = "Sampling locations in Alaska by species",
+       x = "Longitude", y = "Latitude", color = "Species") +
+  theme_bw(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom") +
+  scale_x_continuous(
+    breaks = c(160, 180, 200, 220, 240),
+    labels = function(x) {
+      dplyr::case_when(
+        x == 160 ~ "160°E",
+        x == 180 ~ "180°",
+        x == 200 ~ "160°W",
+        x == 220 ~ "140°W",
+        x == 240 ~ "120°W",
+        TRUE ~ as.character(x)
+      )
+    }
+  )
+
+print(map_specimens)
+
+
+
+
+# Map with distribution ranges from OBIS
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(viridis)
+library(dplyr)
+
+# Prepare data (assuming obis_360 and world_shifted already created)
+# Ensure species_clean is a factor with levels in desired order
+obis_360 <- obis_360 %>%
+  filter(species_clean != "Other") %>%
+  mutate(species_clean = factor(species_clean))
+
+# Compute bounding box of all records (with 2° buffer)
+x_range <- range(obis_360$lon_360)
+y_range <- range(obis_360$decimalLatitude)
+
+xlim_data <- c(x_range[1] - 2, x_range[2] + 2)
+ylim_data <- c(y_range[1] - 2, y_range[2] + 2)
+
+mycale_range <- obis_360 %>%
+  filter(species_clean == "Mycale loveni") %>%
+  summarise(min_lat = min(decimalLatitude), max_lat = max(decimalLatitude))
+print(mycale_range)
+
+# Let's check Mycale's latitude range:
+obis_360 %>%
+  filter(species_clean == "Mycale loveni") %>%
+  summarise(min_lat = min(decimalLatitude), max_lat = max(decimalLatitude))
+
+# If it's, say, 48–62, then set ylim = c(48, 65) to include all.
+
+# Choose final limits (example using data range with a buffer)
+xlim_final <- c(160, 260)   # still covers the Pacific-centered longitudes of interest
+ylim_final <- c(30, 71)      # adjust based on Mycale's minimum
+
+# Ensure obis_360 has species_clean and lon_360
+# (Assuming already prepared as per previous steps)
+
+# Shifted world map
+world_shifted <- st_shift_longitude(ne_countries(scale = "medium", returnclass = "sf"))
+
+# Create the map
+map_hex <- ggplot() +
+  geom_sf(data = world_shifted, fill = "gray99", color = "gray70", size = 0.2) +
+  geom_hex(data = obis_360,
+           aes(x = lon_360, y = decimalLatitude, fill = after_stat(count)),
+           bins = 30, alpha = 0.8) +
+  scale_fill_viridis_c(
+    name = "Number of\nrecords (log)",
+    option = "plasma",
+    trans = "log10",                # log transform to handle wide count range
+    labels = scales::label_number()  # show actual numbers (not log)
+  ) +
+  facet_wrap(~ species_clean, nrow = 2) +
+  coord_sf(xlim = xlim_final, ylim = ylim_final, expand = FALSE) +
+  labs(title = "OBIS record density per species",
+       x = "Longitude", y = "Latitude") +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "italic", size = 10),
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  ) +
+scale_x_continuous(
+    breaks = c(160, 180, 200, 220, 240),
+    labels = function(x) {
+      dplyr::case_when(
+        x == 160 ~ "160°E",
+        x == 180 ~ "180°",
+        x == 200 ~ "160°W",
+        x == 220 ~ "140°W",
+        x == 240 ~ "120°W",
+        TRUE ~ as.character(x)
+      )
+    }
+  )
+print(map_hex)
+
+```
+
+
+## THORSEN'S RULE
+
+```{r}
+
+## Test of Thorsons Rule :) 
+# Have deeper and polar species larger larvae? 
+
+data <- read.csv("poecilosclerid_larvae.csv")
+
+str(data)
+names(data)
+summary(data)
+
+data <- data[, colSums(!is.na(data)) > 0]
+data$Depth <- as.numeric(data$Depth)
+
+# Latitude
+data$latitude <- as.numeric(data$Approx..Latitude)
+# Absolute latitude
+data$abs_latitude <- abs(data$latitude)
+# Larval size
+data$larval_size <- as.numeric(data$Larvae.size)
+
+# remove missing values for the model
+d <- subset(data,
+                  !is.na(larval_size) &
+                    !is.na(abs_latitude) &
+                    !is.na(Depth))
+
+ggplot(d, aes(abs_latitude, larval_size)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Absolute latitude",
+    y = "Larval size (µm)"
+  )
+
+#Test if larvae get bigger with latitude
+m <- lm(log10(larval_size) ~ abs_latitude, data = d)
+summary(m)
+
+# Is there a family signal? 
+lm(log10(larval_size) ~ abs_latitude + Family, data = d)
+
+ggplot(d, aes(x = abs_latitude, y = Depth, color = Family)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Absolute latitude",
+    y = "Depth",
+    color = "Family"
+  )
+
+d$log_larval <- log10(d$larval_size)
+
+## Remove cladorizidae because they might bias the analysis... 
+d_no_carn <- subset(d, Family != "Cladorhizidae")
+
+
+m_full <- lm(log_larval ~ abs_latitude + Depth, data = d)
+m_no_carn <- lm(log_larval ~ abs_latitude + Depth, data = d_no_carn)
+
+summary(m_full)
+summary(m_no_carn)
+
+
+library(ggplot2)
+library(patchwork)
+
+
+p1 <- ggplot(d_no_carn,
+             aes(x = abs_latitude,
+                 y = log_larval,
+                 color = Family)) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "black") +
+  theme_classic() +
+  labs(
+    x = "Absolute latitude (°)",
+    y = expression(Log[10]~"larval size (µm)"),
+    title = "A"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+p2 <- ggplot(d_no_carn,
+             aes(x = Depth,
+                 y = log_larval,
+                 color = Family)) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "black") +
+  theme_classic() +
+  labs(
+    x = "Depth (m)",
+    y = expression(Log[10]~"larval size (µm)"),
+    title = "B"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+p3 <- ggplot(d_no_carn,
+             aes(x = abs_latitude,
+                 y = Depth,
+                 color = Family)) +
+  geom_point(size = 3, alpha = 0.85) +
+  theme_classic() +
+  labs(
+    x = "Absolute latitude (°)",
+    y = "Depth (m)",
+    title = "C"
+  ) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+
+final_fig <- (p1 | p2) / p3 +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+final_fig
+
+## STATS for dataset without carnivorous sponges - only filter feeding sponges!
+
+#1. Single variable test 
+m_lat <- lm(log_larval ~ abs_latitude, data = d_no_carn)
+m_depth <- lm(log_larval ~ Depth, data = d_no_carn)
+
+summary(m_lat)
+summary(m_depth)
+ 
+summary(m_depth)$r.squared
+summary(m_depth)$coefficients
+
+summary(m_lat)$r.squared
+summary(m_lat)$coefficients
+
+
+#2. Combined model
+m_both <- lm(log_larval ~ abs_latitude + Depth, data = d_no_carn)
+
+summary(m_both)
+
+#3. Is depth or lat driving the signal?
+anova(m_lat, m_both)   # does depth improve model beyond latitude?
+anova(m_depth, m_both) # does latitude improve model beyond depth?
+
+#Show with R squared and P value, plus regression line/ smooth line 
+library(ggpmisc)
+ggplot(d_no_carn, aes(x = Depth, y = log_larval)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  stat_poly_eq(
+    formula = y ~ x,
+    aes(label = paste(..rr.label.., ..p.value.label.., sep = "~~~")),
+    parse = TRUE,
+    label.x.npc = "right",
+    label.y.npc = "top"
+  ) +
+  theme_classic()
+
+ggplot(d_no_carn, aes(x = abs_latitude, y = log_larval)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  stat_poly_eq(
+    formula = y ~ x,
+    aes(label = paste(..rr.label.., ..p.value.label.., sep = "~~~")),
+    parse = TRUE,
+    label.x.npc = "right",
+    label.y.npc = "top"
+  ) +
+  theme_classic()
+
+library(car)
+vif(m_both)
+
+```
+
+
